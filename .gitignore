@@ -1,0 +1,21 @@
+# Experiment results (untracked, agent-managed)
+results.tsv
+
+# Run logs
+*.log
+run_*.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
