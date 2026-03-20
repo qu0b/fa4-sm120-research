@@ -228,9 +228,9 @@ def benchmark_one(
             end_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
 
             for i in range(bench_iters):
-                start_events[i].record(torch.cuda.Stream(device))
+                start_events[i].record()
                 out = attn_fn(q, k, v, causal=problem.causal)
-                end_events[i].record(torch.cuda.Stream(device))
+                end_events[i].record()
 
             torch.cuda.synchronize(device)
             times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
@@ -253,9 +253,9 @@ def benchmark_one(
                     q.grad = k.grad = v.grad = None
                     out = attn_fn(q, k, v, causal=problem.causal)
                     dout = torch.randn_like(out)
-                    start_events[i].record(torch.cuda.Stream(device))
+                    start_events[i].record()
                     out.backward(dout)
-                    end_events[i].record(torch.cuda.Stream(device))
+                    end_events[i].record()
 
                 torch.cuda.synchronize(device)
                 times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
