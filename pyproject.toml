@@ -5,9 +5,12 @@ description = "Autonomous kernel optimization for FlashAttention-4 on SM120 GPUs
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "flash-attn-4",
+    "flash-attn-4>=4.0.0b1",
     "torch==2.9.1",
 ]
+
+[tool.uv]
+prerelease = "allow"
 
 [tool.uv.sources]
 torch = [
