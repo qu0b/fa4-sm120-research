@@ -249,7 +249,8 @@ def get_experiment_attn_fn(experiment: dict):
     from flash_attn.cute import flash_attn_func
 
     def attn_fn(q, k, v, causal=False):
-        return flash_attn_func(q, k, v, causal=causal)
+        result = flash_attn_func(q, k, v, causal=causal)
+        return result[0] if isinstance(result, tuple) else result
 
     return attn_fn
 
