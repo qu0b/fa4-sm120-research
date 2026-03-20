@@ -6,7 +6,7 @@ Usage:
     python prepare.py                # run baseline benchmark suite
     python prepare.py --baseline     # same as above
     python prepare.py --quick        # quick smoke test (subset of configs)
-    python prepare.py --profile      # run with torch profiler
+    python prepare.py --device 1     # benchmark on cuda:1
 
 This file is READ-ONLY. The agent does not modify it.
 """
@@ -14,11 +14,13 @@ This file is READ-ONLY. The agent does not modify it.
 import os
 import sys
 import time
+import json
 import math
 import argparse
 import subprocess
-from dataclasses import dataclass, field
-from typing import Optional
+import multiprocessing as mp
+from dataclasses import dataclass, field, asdict
+from typing import Optional, Callable
 from statistics import geometric_mean
 
 import torch
@@ -32,7 +34,7 @@ SM120_ARCH = 120
 SM120_SMEM_DEFAULT = 48 * 1024      # 48 KB
 SM120_SMEM_OPTIN = 101376           # 99 KB (actual)
 SM120_NUM_SMS = 188
-SM120_PEAK_TFLOPS_BF16 = 300.0      # theoretical peak
+SM120_PEAK_TFLOPS_BF16 = 300.0      # theoretical peak per GPU
 
 # Benchmark parameters
 WARMUP_ITERS = 10        # warmup iterations (includes compilation)
@@ -67,10 +69,9 @@ class ProblemSize:
     @property
     def flops_fwd(self) -> float:
         """FLOPs for forward pass (2 * batch * nheads * seqlen_q * seqlen_k * headdim * 2)."""
-        # Standard attention: Q@K^T (2*s*s*d) + softmax@V (2*s*s*d) per head per batch
         f = 4 * self.batch * self.nheads_q * self.seqlen_q * self.seqlen_k * self.headdim
         if self.causal:
-            f //= 2  # approximately half the work
+            f //= 2
         return f
 
     @property
@@ -81,7 +82,7 @@ class ProblemSize:
 
 # The canonical problem sizes. These define what "performance" means.
 PROBLEM_SIZES_FULL = [
-    # Large sequence lengths (memory-bound → bandwidth-sensitive)
+    # Large sequence lengths (memory-bound -> bandwidth-sensitive)
     ProblemSize(1, 8192, 8192, 16, 16, 128, causal=False),
     ProblemSize(1, 8192, 8192, 16, 16, 128, causal=True),
     ProblemSize(1, 16384, 16384, 16, 16, 128, causal=False),
@@ -96,7 +97,7 @@ PROBLEM_SIZES_FULL = [
     ProblemSize(2, 4096, 4096, 16, 16, 96, causal=True),
     ProblemSize(4, 2048, 2048, 32, 32, 64, causal=False),
     ProblemSize(4, 2048, 2048, 32, 32, 64, causal=True),
-    # Short sequences (compute-bound → MMA throughput)
+    # Short sequences (compute-bound -> MMA throughput)
     ProblemSize(8, 1024, 1024, 16, 16, 128, causal=False),
     ProblemSize(16, 512, 512, 32, 32, 128, causal=False),
     # GQA configurations
@@ -115,19 +116,20 @@ PROBLEM_SIZES_QUICK = [
 # GPU detection
 # ---------------------------------------------------------------------------
 
-def detect_gpu():
+def detect_gpu(device_id: int = 0):
     """Detect GPU and verify it's SM120."""
     if not torch.cuda.is_available():
         print("ERROR: No CUDA GPU available")
         sys.exit(1)
 
-    device = torch.device("cuda:0")
+    device = torch.device(f"cuda:{device_id}")
     name = torch.cuda.get_device_name(device)
     cap = torch.cuda.get_device_capability(device)
     arch = cap[0] * 10 + cap[1]
     mem_gb = torch.cuda.get_device_properties(device).total_mem / (1024**3)
 
     print(f"gpu_name:      {name}")
+    print(f"gpu_device:    cuda:{device_id}")
     print(f"gpu_arch:      sm_{arch}0")
     print(f"gpu_vram_gb:   {mem_gb:.1f}")
     print(f"num_sms:       {torch.cuda.get_device_properties(device).multi_processor_count}")
@@ -136,6 +138,18 @@ def detect_gpu():
         print(f"WARNING: Expected SM120, got SM{arch}0. Results may not be meaningful.")
 
     return arch, name
+
+
+def detect_all_gpus():
+    """Detect all available GPUs. Returns list of (device_id, arch, name)."""
+    n = torch.cuda.device_count()
+    gpus = []
+    for i in range(n):
+        cap = torch.cuda.get_device_capability(i)
+        arch = cap[0] * 10 + cap[1]
+        name = torch.cuda.get_device_name(i)
+        gpus.append((i, arch, name))
+    return gpus
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +193,7 @@ class BenchResult:
 def benchmark_one(
     problem: ProblemSize,
     attn_fn,
+    device: str = "cuda:0",
     warmup_iters: int = WARMUP_ITERS,
     bench_iters: int = BENCH_ITERS,
     bench_repeats: int = BENCH_REPEATS,
@@ -191,11 +206,11 @@ def benchmark_one(
     result = BenchResult(problem=problem)
 
     try:
-        torch.cuda.reset_peak_memory_stats()
-        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats(device)
+        torch.cuda.synchronize(device)
 
         # Create tensors
-        q, k, v = make_tensors(problem, requires_grad=do_backward)
+        q, k, v = make_tensors(problem, device=device, requires_grad=do_backward)
 
         # Warmup (includes JIT compilation)
         for _ in range(warmup_iters):
@@ -204,7 +219,7 @@ def benchmark_one(
                 dout = torch.randn_like(out)
                 out.backward(dout)
                 q.grad = k.grad = v.grad = None
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
 
         # Forward benchmark
         best_fwd_ms = float("inf")
@@ -213,13 +228,12 @@ def benchmark_one(
             end_events = [torch.cuda.Event(enable_timing=True) for _ in range(bench_iters)]
 
             for i in range(bench_iters):
-                start_events[i].record()
+                start_events[i].record(torch.cuda.Stream(device))
                 out = attn_fn(q, k, v, causal=problem.causal)
-                end_events[i].record()
+                end_events[i].record(torch.cuda.Stream(device))
 
-            torch.cuda.synchronize()
+            torch.cuda.synchronize(device)
             times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
-            # Drop highest and lowest, take mean of the rest
             times.sort()
             trimmed = times[2:-2] if len(times) > 4 else times
             mean_ms = sum(trimmed) / len(trimmed)
@@ -239,11 +253,11 @@ def benchmark_one(
                     q.grad = k.grad = v.grad = None
                     out = attn_fn(q, k, v, causal=problem.causal)
                     dout = torch.randn_like(out)
-                    start_events[i].record()
+                    start_events[i].record(torch.cuda.Stream(device))
                     out.backward(dout)
-                    end_events[i].record()
+                    end_events[i].record(torch.cuda.Stream(device))
 
-                torch.cuda.synchronize()
+                torch.cuda.synchronize(device)
                 times = [s.elapsed_time(e) for s, e in zip(start_events, end_events)]
                 times.sort()
                 trimmed = times[2:-2] if len(times) > 4 else times
@@ -253,14 +267,13 @@ def benchmark_one(
             result.bwd_ms = best_bwd_ms
             result.bwd_tflops = (problem.flops_bwd / (best_bwd_ms / 1000)) / 1e12
 
-        result.peak_vram_mb = torch.cuda.max_memory_allocated() / (1024**2)
+        result.peak_vram_mb = torch.cuda.max_memory_allocated(device) / (1024**2)
         result.status = "ok"
 
     except Exception as e:
         result.status = "crash"
         result.error = str(e)
 
-    # Cleanup
     torch.cuda.empty_cache()
     return result
 
@@ -270,13 +283,14 @@ def run_benchmark_suite(
     problems: list[ProblemSize] = None,
     do_backward: bool = True,
     label: str = "experiment",
+    device: str = "cuda:0",
 ) -> list[BenchResult]:
     """Run the full benchmark suite and print results."""
     if problems is None:
         problems = PROBLEM_SIZES_FULL
 
     print(f"\n{'='*80}")
-    print(f"  Benchmark: {label}")
+    print(f"  Benchmark: {label} (on {device})")
     print(f"{'='*80}\n")
 
     results = []
@@ -285,7 +299,7 @@ def run_benchmark_suite(
 
     for i, problem in enumerate(problems):
         print(f"[{i+1}/{len(problems)}] {problem.label} ...", end=" ", flush=True)
-        r = benchmark_one(problem, attn_fn, do_backward=do_backward)
+        r = benchmark_one(problem, attn_fn, device=device, do_backward=do_backward)
         results.append(r)
 
         if r.status == "ok":
@@ -335,10 +349,76 @@ def run_benchmark_suite(
 
 
 # ---------------------------------------------------------------------------
+# Parallel experiment runner — run two experiments on two GPUs simultaneously
+# ---------------------------------------------------------------------------
+
+def _run_experiment_worker(gpu_id, experiment_script, experiment_name, result_file):
+    """Subprocess worker: runs experiment_script as a separate process on a specific GPU.
+
+    The experiment_script is a Python file that, when run with env var
+    CUDA_VISIBLE_DEVICES=gpu_id, writes JSON results to result_file.
+    """
+    env = os.environ.copy()
+    env["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    env["FA4_RESULT_FILE"] = result_file
+    env["FA4_EXPERIMENT_NAME"] = experiment_name
+
+    proc = subprocess.run(
+        [sys.executable, experiment_script],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,  # 15 min hard timeout
+    )
+    return proc.stdout, proc.stderr, proc.returncode
+
+
+def run_parallel_experiments(experiments: list[dict], script_path: str = "experiment.py"):
+    """Run multiple experiments in parallel, one per GPU.
+
+    Each experiment dict has:
+        - "name": str — experiment label
+        - "gpu": int — GPU device id
+        - Any other keys are passed as env vars prefixed with FA4_
+
+    Returns list of (name, stdout, stderr, returncode) tuples.
+    """
+    import tempfile
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    gpus = detect_all_gpus()
+    n_gpus = len(gpus)
+    print(f"Available GPUs: {n_gpus}")
+    for gid, arch, name in gpus:
+        print(f"  cuda:{gid} — {name} (sm_{arch}0)")
+    print()
+
+    results = []
+    with ProcessPoolExecutor(max_workers=n_gpus) as pool:
+        futures = {}
+        for exp in experiments:
+            gpu_id = exp["gpu"]
+            name = exp["name"]
+            result_file = tempfile.mktemp(suffix=".json", prefix=f"fa4_{name}_")
+            fut = pool.submit(_run_experiment_worker, gpu_id, script_path, name, result_file)
+            futures[fut] = (name, result_file)
+
+        for fut in as_completed(futures):
+            name, result_file = futures[fut]
+            try:
+                stdout, stderr, rc = fut.result()
+                results.append({"name": name, "stdout": stdout, "stderr": stderr, "rc": rc, "result_file": result_file})
+            except Exception as e:
+                results.append({"name": name, "stdout": "", "stderr": str(e), "rc": -1, "result_file": ""})
+
+    return results
+
+
+# ---------------------------------------------------------------------------
 # Reference: default FA4 attention function (current SM80 path)
 # ---------------------------------------------------------------------------
 
-def get_default_attn_fn():
+def get_default_attn_fn(device: str = "cuda:0"):
     """Get the default FA4 attention function (whatever the installed package provides)."""
     try:
         from flash_attn.cute import flash_attn_func
@@ -353,7 +433,6 @@ def get_default_attn_fn():
 def get_torch_sdpa_fn():
     """Get PyTorch's scaled_dot_product_attention as a reference."""
     def attn_fn(q, k, v, causal=False):
-        # SDPA expects (batch, nheads, seqlen, headdim)
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
@@ -392,7 +471,7 @@ def compare_results(baseline: list[BenchResult], experiment: list[BenchResult]):
 # Correctness check
 # ---------------------------------------------------------------------------
 
-def check_correctness(attn_fn, rtol=1e-2, atol=1e-2):
+def check_correctness(attn_fn, device: str = "cuda:0", rtol=1e-2, atol=1e-2):
     """Verify the attention function produces correct results against PyTorch SDPA."""
     print("\nCorrectness check...")
     ref_fn = get_torch_sdpa_fn()
@@ -405,7 +484,7 @@ def check_correctness(attn_fn, rtol=1e-2, atol=1e-2):
 
     all_pass = True
     for problem in test_cases:
-        q, k, v = make_tensors(problem)
+        q, k, v = make_tensors(problem, device=device)
         out = attn_fn(q, k, v, causal=problem.causal)
         ref = ref_fn(q, k, v, causal=problem.causal)
 
@@ -431,13 +510,15 @@ if __name__ == "__main__":
     parser.add_argument("--fwd-only", action="store_true", help="Forward only (skip backward)")
     parser.add_argument("--check", action="store_true", help="Run correctness check only")
     parser.add_argument("--sdpa", action="store_true", help="Benchmark PyTorch SDPA as reference")
+    parser.add_argument("--device", type=int, default=0, help="GPU device id (default: 0)")
     args = parser.parse_args()
 
-    arch, gpu_name = detect_gpu()
+    device = f"cuda:{args.device}"
+    arch, gpu_name = detect_gpu(args.device)
 
     if args.check:
-        attn_fn = get_default_attn_fn()
-        ok = check_correctness(attn_fn)
+        attn_fn = get_default_attn_fn(device)
+        ok = check_correctness(attn_fn, device=device)
         sys.exit(0 if ok else 1)
 
     problems = PROBLEM_SIZES_QUICK if args.quick else PROBLEM_SIZES_FULL
@@ -446,7 +527,7 @@ if __name__ == "__main__":
         attn_fn = get_torch_sdpa_fn()
         label = "PyTorch SDPA reference"
     else:
-        attn_fn = get_default_attn_fn()
+        attn_fn = get_default_attn_fn(device)
         label = "FA4 baseline (current installed)"
 
     results = run_benchmark_suite(
@@ -454,4 +535,5 @@ if __name__ == "__main__":
         problems=problems,
         do_backward=not args.fwd_only,
         label=label,
+        device=device,
     )

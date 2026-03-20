@@ -104,12 +104,35 @@ Current config: m=128, n=128, threads=256, stages=1. Systematic sweep of:
 ### 6. Backward kernel (LOW-MEDIUM)
 Less optimized than forward. Same techniques apply: cp.async, pipeline stages, block sizes.
 
+## Dual-GPU parallel experiments
+
+The system has **2 GPUs**. `experiment.py` defines two experiments — `EXPERIMENT_A` and `EXPERIMENT_B` — that run **simultaneously**, one per GPU. This doubles throughput: ~24 experiments/hour instead of ~12.
+
+**How to use this**:
+
+Each iteration, you test TWO ideas at once. Set `EXPERIMENT_A` to one variant and `EXPERIMENT_B` to another. Run them in parallel. The script prints a side-by-side comparison showing which is better.
+
+Strategies for picking A vs B:
+- **A/B split**: A = current best, B = new idea. If B wins, it becomes the new A next round.
+- **Two ideas**: A = idea 1, B = idea 2. Keep whichever is better (or both if both improve).
+- **Bisection**: A = aggressive change, B = conservative change. Narrow in on the sweet spot.
+- **Baseline check**: A = unchanged baseline, B = experimental. Ensures no measurement noise.
+
+Running:
+```bash
+# Parallel (default): runs EXPERIMENT_A on cuda:0 and EXPERIMENT_B on cuda:1
+python experiment.py > run.log 2>&1
+
+# Single GPU only (for debugging or when only 1 GPU is free)
+python experiment.py --single > run.log 2>&1
+```
+
 ## Output format
 
-The experiment script prints a summary:
+The experiment script prints a summary for each experiment:
 
 ```
----
+--- baseline_A ---
 fwd_tflops_peak:     275.5
 fwd_tflops_geomean:  260.0
 bwd_tflops_peak:     180.0
@@ -118,16 +141,25 @@ peak_vram_mb:        4500.0
 total_seconds:       120.5
 configs_tested:      16
 configs_crashed:     0
+
+--- n_block_192_B ---
+fwd_tflops_peak:     278.3
+fwd_tflops_geomean:  263.1
+...
+
+  COMPARISON: baseline_A vs n_block_192_B
+  fwd_tflops_geomean        A=  260.0  B=  263.1  (+1.2%)  -> B wins
 ```
 
 Extract key metrics:
 ```
-grep "^fwd_tflops_peak:\|^fwd_tflops_geomean:\|^bwd_tflops_peak:" run.log
+grep "^fwd_tflops_geomean:\|^bwd_tflops_geomean:" run.log
+grep "COMPARISON" -A 5 run.log
 ```
 
 ## Logging results
 
-When an experiment is done, log it to `results.tsv` (tab-separated).
+When an experiment is done, log BOTH results to `results.tsv` (tab-separated).
 
 Header row and 6 columns:
 
@@ -140,16 +172,16 @@ commit	fwd_geomean	bwd_geomean	peak_vram_gb	status	description
 3. bwd_tflops_geomean (e.g. 165.0) — use 0.0 for crashes
 4. peak VRAM in GB (divide peak_vram_mb by 1024, round to .1f) — use 0.0 for crashes
 5. status: `keep`, `discard`, or `crash`
-6. short description of what the experiment tried
+6. short description — prefix with `[A]` or `[B]` to track which experiment
 
 Example:
 
 ```
 commit	fwd_geomean	bwd_geomean	peak_vram_gb	status	description
-a1b2c3d	260.0	165.0	4.4	keep	baseline
-b2c3d4e	265.3	165.0	4.4	keep	increase n_block to 192
-c3d4e5f	258.0	163.0	4.8	discard	3-stage pipeline (slower, more vram)
-d4e5f6g	0.0	0.0	0.0	crash	TMA kernel OOM on b=1 s=16384
+a1b2c3d	260.0	165.0	4.4	keep	[A] baseline
+a1b2c3d	260.0	165.0	4.4	keep	[B] baseline
+b2c3d4e	260.0	165.0	4.4	discard	[A] baseline (control)
+b2c3d4e	265.3	165.0	4.4	keep	[B] increase n_block to 192
 ```
 
 ## The experiment loop
@@ -159,19 +191,20 @@ The experiment runs on a dedicated branch (e.g. `qu0b/sm120-opt/mar19`).
 LOOP FOREVER:
 
 1. Look at the git state: current branch/commit, recent results in results.tsv.
-2. Decide what to try next. Prioritize:
+2. Decide what to try next. Pick TWO ideas — one for each GPU. Prioritize:
    - Fixing crashes from the previous experiment
    - High-impact changes (TMA, cp.async) over low-impact (config tweaks)
    - Simple changes before complex ones
    - Combining previous near-misses
-3. Modify `experiment.py` with the experimental idea.
+   - Use one GPU as control (baseline) when testing risky changes
+3. Set `EXPERIMENT_A` and `EXPERIMENT_B` in `experiment.py`.
 4. git commit.
-5. Run the experiment: `python experiment.py > run.log 2>&1`
-6. Read results: `grep "^fwd_tflops_geomean:\|^bwd_tflops_geomean:\|^peak_vram_mb:" run.log`
+5. Run: `python experiment.py > run.log 2>&1`
+6. Read results: `grep "COMPARISON" -A 5 run.log`
 7. If grep output is empty, the run crashed. `tail -50 run.log` for stack trace.
-8. Record results in results.tsv (do NOT commit results.tsv).
-9. If fwd_tflops_geomean improved: keep the commit (advance branch).
-10. If equal or worse: `git reset --soft HEAD~1` (discard).
+8. Record BOTH results in results.tsv (do NOT commit results.tsv).
+9. If either experiment improved fwd_tflops_geomean: keep the commit, update the winning config as the new baseline for next round.
+10. If both equal or worse: `git reset --soft HEAD~1` (discard).
 
 **Timeout**: Each benchmark run should take 2-5 minutes. If it exceeds 15 minutes, kill it and treat as failure.
 
