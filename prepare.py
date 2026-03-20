@@ -130,12 +130,12 @@ def detect_gpu(device_id: int = 0):
 
     print(f"gpu_name:      {name}")
     print(f"gpu_device:    cuda:{device_id}")
-    print(f"gpu_arch:      sm_{arch}0")
+    print(f"gpu_arch:      sm_{cap[0]}{cap[1]}")
     print(f"gpu_vram_gb:   {mem_gb:.1f}")
     print(f"num_sms:       {torch.cuda.get_device_properties(device).multi_processor_count}")
 
-    if arch != 12:
-        print(f"WARNING: Expected SM120, got SM{arch}0. Results may not be meaningful.")
+    if arch // 10 != 12:
+        print(f"WARNING: Expected SM12.x, got SM{cap[0]}.{cap[1]}. Results may not be meaningful.")
 
     return arch, name
 
