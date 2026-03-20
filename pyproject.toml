@@ -16,6 +16,7 @@ prerelease = "allow"
 torch = [
     { index = "pytorch-cu130" },
 ]
+flash-attn-4 = { path = "/data/repos/flash-attention/flash_attn/cute", editable = true }
 
 [[tool.uv.index]]
 name = "pytorch-cu130"
