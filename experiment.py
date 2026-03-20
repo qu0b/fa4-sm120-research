@@ -115,7 +115,8 @@ EXPERIMENT_B = {
 }
 
 # Benchmark settings
-PROBLEM_SIZES = PROBLEM_SIZES_FULL
+# GQA configs crash on SM120 (pack_gqa.py crd2idx bug), exclude them
+PROBLEM_SIZES = [p for p in PROBLEM_SIZES_FULL if p.nheads_q == p.nheads_k]
 DO_BACKWARD = True
 DO_CORRECTNESS = True
 
