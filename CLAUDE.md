@@ -7,8 +7,8 @@ Autonomous kernel optimization research for FlashAttention-4 on SM120 (RTX PRO 6
 ## How to run experiments
 
 ```bash
-# Activate your FA4 virtualenv (must have flash-attn-4 installed)
-python experiment.py > run.log 2>&1
+uv sync                                          # install deps (first time)
+uv run python experiment.py > run.log 2>&1       # run experiment
 grep "^fwd_tflops_geomean:\|^bwd_tflops_geomean:" run.log
 ```
 

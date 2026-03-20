@@ -1,0 +1,20 @@
+[project]
+name = "fa4-sm120-research"
+version = "0.1.0"
+description = "Autonomous kernel optimization for FlashAttention-4 on SM120 GPUs"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "flash-attn-4",
+    "torch==2.9.1",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true

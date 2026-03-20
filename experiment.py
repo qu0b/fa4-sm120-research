@@ -361,6 +361,7 @@ with open("{result_file}", "w") as f:
         proc = subprocess.run(
             [sys.executable, "-c", script],
             capture_output=True, text=True, timeout=900,
+            cwd=os.path.dirname(os.path.abspath(__file__)),
         )
         if proc.returncode != 0:
             print(f"\n[{experiment['name']}] STDERR:\n{proc.stderr[-2000:]}")

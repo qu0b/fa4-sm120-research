@@ -5,7 +5,9 @@ results.tsv
 *.log
 run_*.txt
 
-# Python
+# Python / uv
+.venv/
+uv.lock
 __pycache__/
 *.pyc
 *.pyo

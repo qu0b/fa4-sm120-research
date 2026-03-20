@@ -18,7 +18,8 @@ To set up a new experiment run, work with the user to:
    - `flash_bwd.py` — backward kernels. `FlashAttentionBackwardSm80` is the current SM120 path.
    - `copy_utils.py` — TMA and async copy utilities.
    - `mask.py` — attention mask application.
-5. **Verify baseline**: Run `python prepare.py --baseline` to confirm the GPU works and get reference numbers.
+5. **Install deps**: `uv sync` to install flash-attn-4, torch, and all dependencies.
+6. **Verify baseline**: Run `uv run python prepare.py --baseline` to confirm the GPU works and get reference numbers.
 6. **Initialize results.tsv**: Create `results.tsv` with the header row. The baseline will be the first entry.
 7. **Confirm and go**: Confirm setup is ready.
 
@@ -199,7 +200,7 @@ LOOP FOREVER:
    - Use one GPU as control (baseline) when testing risky changes
 3. Set `EXPERIMENT_A` and `EXPERIMENT_B` in `experiment.py`.
 4. git commit.
-5. Run: `python experiment.py > run.log 2>&1`
+5. Run: `uv run python experiment.py > run.log 2>&1`
 6. Read results: `grep "COMPARISON" -A 5 run.log`
 7. If grep output is empty, the run crashed. `tail -50 run.log` for stack trace.
 8. Record BOTH results in results.tsv (do NOT commit results.tsv).

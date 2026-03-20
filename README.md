@@ -42,17 +42,20 @@ Peak: **275.5 TFLOPS** (92% utilization). The goal is to push beyond this.
 
 ## Quick start
 
-**Requirements:** An SM120 GPU (RTX PRO 6000), Python 3.10+, `flash-attn-4` installed (`pip install flash-attn-4`).
+**Requirements:** An SM120 GPU (RTX PRO 6000), Python 3.10+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
-# 1. Verify GPU
-python -c "import torch; print(torch.cuda.get_device_name())"
+# 1. Install dependencies
+uv sync
 
-# 2. Run baseline benchmark
-python prepare.py --baseline
+# 2. Verify GPU
+uv run python -c "import torch; print(torch.cuda.get_device_name())"
 
-# 3. Run a single experiment
-python experiment.py > run.log 2>&1
+# 3. Run baseline benchmark
+uv run python prepare.py --baseline
+
+# 4. Run a single experiment
+uv run python experiment.py > run.log 2>&1
 grep "^fwd_tflops_peak:\|^bwd_tflops_peak:\|^fwd_tflops_geomean:" run.log
 ```
 
