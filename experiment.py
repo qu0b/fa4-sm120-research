@@ -49,38 +49,38 @@ from prepare import (
 # For baseline, both are identical. The agent changes one or both.
 
 EXPERIMENT_A = {
-    "name": "baseline_A",
-    "description": "baseline (no changes)",
-    # Forward config overrides
+    "name": "upstream_baseline",
+    "description": "upstream SM120 config (128 threads, n=64 for d>64)",
+    # Forward config: upstream uses 128 threads, m=128, n=64 for d>64
     "fwd_config": {
         "m_block_size": 128,
-        "n_block_size": 128,
-        "num_threads": 256,
+        "n_block_size": 64,       # upstream default for d>64
+        "num_threads": 128,        # upstream default (4 warps)
         "num_stages": 1,
     },
-    # Backward config overrides
+    # Backward config: upstream uses 128 threads, m=64, n=64
     "bwd_config": {
         "m_block_size": 64,
         "n_block_size": 64,
-        "num_threads": 256,
+        "num_threads": 128,        # upstream default (4 warps)
     },
 }
 
 EXPERIMENT_B = {
-    "name": "baseline_B",
-    "description": "baseline (no changes)",
-    # Forward config overrides
+    "name": "tuned_256t",
+    "description": "our tuned config (256 threads, n=128)",
+    # Forward config: 256 threads, larger n_block
     "fwd_config": {
         "m_block_size": 128,
-        "n_block_size": 128,
-        "num_threads": 256,
+        "n_block_size": 128,       # larger KV tile (fits in 99KB for d<=128)
+        "num_threads": 256,        # 8 warps — our previous best
         "num_stages": 1,
     },
-    # Backward config overrides
+    # Backward config: 256 threads
     "bwd_config": {
         "m_block_size": 64,
         "n_block_size": 64,
-        "num_threads": 256,
+        "num_threads": 256,        # 8 warps
     },
 }
 

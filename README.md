@@ -23,9 +23,13 @@ By design, each benchmark runs for a **fixed set of problem sizes** with warmup 
 - **Shared memory**: 48KB default, 99KB optin (101376 bytes)
 - **Theoretical peak**: ~300 TFLOPS bf16
 
-## Current baseline
+## Current state
 
-Using the SM80 (Ampere) code path with tuned block sizes:
+As of March 2026, upstream FA4 has **official SM120 support** via dedicated kernel classes (`FlashAttentionForwardSm120`, `FlashAttentionBackwardSm120`) that subclass the SM80 kernels with a 99KB SMEM capacity check. Upstream uses 128 threads (4 warps) with conservative tile sizes.
+
+Our earlier tuning found that **256 threads (8 warps) with larger tiles significantly outperforms** the upstream defaults. The first experiment should verify this on the latest codebase, then feed the improved config back upstream.
+
+### Our tuned baseline (256 threads)
 
 | Config | Fwd ms | Fwd TFLOPS |
 |--------|--------|------------|
@@ -56,23 +60,19 @@ grep "^fwd_tflops_peak:\|^bwd_tflops_peak:\|^fwd_tflops_geomean:" run.log
 
 Ordered roughly by expected impact:
 
-1. **TMA (Tensor Memory Accelerator)** — SM120 supports cp.async.bulk.tensor. Currently blocked by CUTLASS DSL's `atom_tma_partition` MLIR op producing dynamic basis strides in standalone JIT functions. Unblocking this could give 10-20% uplift by eliminating thread-level address computation.
+1. **Validate 256-thread config on latest upstream** — Our tuning found 256 threads (8 warps) much faster than upstream's 128. First priority: reproduce this on the latest code, then PR.
 
-2. **cp.async pipelining** — The SM80 path uses synchronous global loads. SM120 supports cp.async (asynchronous copy to shared memory). Multi-stage pipelining could hide memory latency.
+2. **TMA (Tensor Memory Accelerator)** — SM120 supports cp.async.bulk.tensor. Previously blocked by CUTLASS DSL 4.4.1's `atom_tma_partition`. CUTLASS DSL is now at 4.4.2 — re-test. Could give 10-20% uplift.
 
-3. **Warp specialization** — SM80 path uses homogeneous warps. Dedicated producer/consumer warp roles (like SM90 kernel) could improve throughput even without WGMMA.
+3. **cp.async pipelining** — The SM80 path uses synchronous global loads. Multi-stage pipelining with cp.async could hide memory latency.
 
-4. **Register-to-shared optimizations** — Explore swapAB MMA variants, V_in_regs, Q_in_regs for different head dimensions.
+4. **Config search for SM120** — Upstream added `sm90_config_search.py`. Adapt it for SM120's 99KB SMEM / 128-thread constraints to systematically explore the config space.
 
-5. **Backward kernel tuning** — Current backward config is less optimized than forward. More systematic sweep of block sizes, pipeline stages, register allocation.
+5. **Backward kernel tuning** — Upstream uses conservative backward configs. Our earlier tuning found larger n_block (128 for d<=64) helps. Systematic sweep needed.
 
-6. **Occupancy tuning** — Shared memory partitioning, register pressure management, persistent kernel scheduling.
+6. **Warp specialization** — Dedicated producer/consumer warp roles (like SM90 kernel) could help even without WGMMA.
 
-7. **Block sparsity** — SM80 path lacks block sparse support. Adding it could unlock sparse attention patterns.
-
-8. **GQA/MQA** — pack_gqa has a pre-existing compile error on SM80 path. Fixing it enables grouped-query attention.
-
-9. **Variable-length sequences** — SM80 forward assumes 4D batched tensors. Varlen support needs substantial rewrite.
+7. **Feature parity** — Upstream SM120 lacks: block sparsity, paged KV, SplitKV, score_mod/mask_mod backward, deterministic backward. Each is a contribution opportunity.
 
 ## Project structure
 
