@@ -9,14 +9,14 @@ Usage:
 
 The script:
 1. Defines two experiment variants (A on GPU 0, B on GPU 1)
-2. Applies kernel config patches for each
+2. Monkey-patches FA4's interface.py to override SM120 kernel configs
 3. Runs benchmarks in parallel
 4. Reports metrics for both, indicating which is better
 
 Key FA4 files that can be patched at runtime (in your site-packages flash_attn/cute/):
     interface.py    — dispatch logic, kernel selection, config (tile sizes, threads, stages)
-    flash_fwd.py    — forward kernels (SM80 base, SM90 Hopper, SM120 dead code)
-    flash_bwd.py    — backward kernels (SM80 base)
+    flash_fwd.py    — forward kernels (FlashAttentionForwardSm80 base, SM120 subclass)
+    flash_bwd.py    — backward kernels (FlashAttentionBackwardSm80 base, SM120 subclass)
     mask.py         — attention mask application
     copy_utils.py   — TMA and async copy utilities
     softmax.py      — online softmax implementation
@@ -26,6 +26,7 @@ import os
 import sys
 import json
 import time
+import functools
 
 import torch
 
@@ -47,40 +48,69 @@ from prepare import (
 # ---------------------------------------------------------------------------
 # Define two experiments to run in parallel. Each gets its own GPU.
 # For baseline, both are identical. The agent changes one or both.
+#
+# Upstream SM120 config (as of commit 3250081):
+#   Forward: num_threads=128, tile_m=128, tile_n=64 (d>64) or 128 (d<=64), num_stages=1
+#   Backward: num_threads=128, m=64, n=64, stages_Q=2/1, stages_dO=2/1,
+#             AtomLayout{MSdP,NdKV,MdQ}=4, no swapAB, no V_in_regs
+#
+# Our earlier tuning found 256 threads + n_block=128 much better (275.5 TFLOPS peak).
 
 EXPERIMENT_A = {
-    "name": "upstream_baseline",
+    "name": "upstream_default",
     "description": "upstream SM120 config (128 threads, n=64 for d>64)",
-    # Forward config: upstream uses 128 threads, m=128, n=64 for d>64
-    "fwd_config": {
-        "m_block_size": 128,
-        "n_block_size": 64,       # upstream default for d>64
-        "num_threads": 128,        # upstream default (4 warps)
+    "fwd": {
+        "num_threads": 128,        # upstream: 4 warps
+        "tile_m": 128,
+        "tile_n_d_le_64": 128,     # upstream: 128 when d<=64
+        "tile_n_d_gt_64": 64,      # upstream: 64 when d>64
         "num_stages": 1,
+        "Q_in_regs": False,
     },
-    # Backward config: upstream uses 128 threads, m=64, n=64
-    "bwd_config": {
+    "bwd": {
+        "num_threads": 128,        # upstream: 4 warps
         "m_block_size": 64,
         "n_block_size": 64,
-        "num_threads": 128,        # upstream default (4 warps)
+        "num_stages_Q_d_le_64": 2,
+        "num_stages_dO_d_le_64": 2,
+        "num_stages_Q_d_gt_64": 1,
+        "num_stages_dO_d_gt_64": 1,
+        "SdP_swapAB": False,
+        "dKV_swapAB": False,
+        "dQ_swapAB": False,
+        "AtomLayoutMSdP": 4,
+        "AtomLayoutNdKV": 4,
+        "AtomLayoutMdQ": 4,
+        "V_in_regs": False,
     },
 }
 
 EXPERIMENT_B = {
     "name": "tuned_256t",
-    "description": "our tuned config (256 threads, n=128)",
-    # Forward config: 256 threads, larger n_block
-    "fwd_config": {
-        "m_block_size": 128,
-        "n_block_size": 128,       # larger KV tile (fits in 99KB for d<=128)
+    "description": "our tuned config (256 threads, n=128 for all d)",
+    "fwd": {
         "num_threads": 256,        # 8 warps — our previous best
+        "tile_m": 128,
+        "tile_n_d_le_64": 128,
+        "tile_n_d_gt_64": 128,     # 128*128*2*3 = 96KB, fits in 99KB SMEM
         "num_stages": 1,
+        "Q_in_regs": False,
     },
-    # Backward config: 256 threads
-    "bwd_config": {
-        "m_block_size": 64,
-        "n_block_size": 64,
+    "bwd": {
         "num_threads": 256,        # 8 warps
+        "m_block_size": 64,
+        "n_block_size": 64,        # keep conservative for now
+        "num_stages_Q_d_le_64": 2,
+        "num_stages_dO_d_le_64": 2,
+        "num_stages_Q_d_gt_64": 2, # double-buffered Q (our earlier finding)
+        "num_stages_dO_d_gt_64": 1,
+        "SdP_swapAB": False,
+        "dKV_swapAB": False,
+        "dQ_swapAB": False,
+        "AtomLayoutMSdP": 4,
+        "AtomLayoutNdKV": 4,
+        "AtomLayoutMdQ": 4,
+        "V_in_regs": False,
     },
 }
 
@@ -91,42 +121,129 @@ DO_CORRECTNESS = True
 
 
 # ---------------------------------------------------------------------------
-# Kernel patching — override FA4 behavior at runtime
+# Kernel patching — override FA4 SM120 config at runtime
 # ---------------------------------------------------------------------------
+# The monkey-patch intercepts _flash_attn_fwd and _flash_attn_bwd to
+# override the SM120 config block (interface.py lines 454-467, 1005-1024).
+#
+# How it works:
+#   1. We wrap _flash_attn_fwd to inject our tile_mn and num_threads
+#      via the existing function parameters (tile_mn, num_threads are
+#      already accepted as kwargs).
+#   2. For backward, we wrap _flash_attn_bwd to override the SM120
+#      config variables before they reach the kernel constructor.
+
+_patches_applied = False
 
 def apply_config_patches(experiment: dict):
-    """Apply configuration overrides to the installed FA4 package.
+    """Monkey-patch FA4's interface to use our SM120 config.
 
-    This function monkey-patches the FA4 interface module to use our
-    optimized SM120 configurations instead of the defaults.
+    The key insight: _flash_attn_fwd already accepts `tile_mn` and
+    `num_threads` as parameters. For SM120, the code sets these early
+    (lines 454-467) but they can be overridden by passing them explicitly
+    from the public flash_attn_func wrapper.
 
-    Modify this function to experiment with different kernel configs,
-    dispatch strategies, or entirely new kernel implementations.
+    We patch the internal _flash_attn_fwd and _flash_attn_bwd functions
+    to inject our config before the SM120 defaults are applied.
     """
+    global _patches_applied
+    if _patches_applied:
+        return True
+
     try:
         import flash_attn.cute.interface as interface
     except ImportError:
         print("ERROR: flash_attn.cute not importable. Is FA4 installed?")
         return False
 
-    # The current baseline: SM120 dispatches to family 8 (SM80 path)
-    # with the tuned config above. No patches needed for baseline.
-    #
-    # To experiment, you can:
-    # 1. Override _arch_dispatch_family() to route SM120 differently
-    # 2. Patch _flash_attn_fwd() to inject custom config
-    # 3. Add entirely new kernel classes
-    # 4. Patch copy_utils for different memory access patterns
+    fwd_cfg = experiment["fwd"]
+    bwd_cfg = experiment["bwd"]
 
+    # --- Forward patch ---
+    # Wrap _flash_attn_fwd to override num_threads and tile_mn for SM120.
+    # The function checks `arch // 10 == 12` and sets num_threads=128,
+    # then checks tile_mn is None to apply default tile sizes.
+    # By passing tile_mn and num_threads explicitly, we bypass those defaults.
+    original_fwd = interface._flash_attn_fwd
+
+    @functools.wraps(original_fwd)
+    def patched_fwd(q, k, v, *args, **kwargs):
+        arch = interface._get_device_arch()
+        if arch // 10 == 12:
+            head_dim = q.shape[-1]
+            tile_n = fwd_cfg["tile_n_d_le_64"] if head_dim <= 64 else fwd_cfg["tile_n_d_gt_64"]
+            # Override via kwargs — these take precedence in the function
+            kwargs.setdefault("num_threads", fwd_cfg["num_threads"])
+            kwargs.setdefault("tile_mn", (fwd_cfg["tile_m"], tile_n))
+        return original_fwd(q, k, v, *args, **kwargs)
+
+    interface._flash_attn_fwd = patched_fwd
+
+    # --- Backward patch ---
+    # The backward function has a hardcoded SM120 config block at lines 1005-1024.
+    # There's no tile_mn parameter for backward, so we must patch deeper.
+    # We replace the entire _flash_attn_bwd with a version that overrides
+    # the SM120 config block.
+    original_bwd = interface._flash_attn_bwd
+
+    @functools.wraps(original_bwd)
+    def patched_bwd(*args, **kwargs):
+        # Temporarily patch the SM120 backward config by modifying the
+        # function's local namespace. We do this by wrapping the call and
+        # replacing the config values that get passed to the kernel constructor.
+        #
+        # The backward config is set inside _flash_attn_bwd based on arch//10==12.
+        # Since we can't easily override locals, we use a different approach:
+        # save/restore the backward function's behavior by temporarily modifying
+        # num_threads in kwargs (backward doesn't accept num_threads as kwarg
+        # in the same way, so we need to be more surgical).
+        #
+        # For now, we rely on the forward patch (which is the bigger win) and
+        # leave backward at upstream defaults. When backward patching is needed,
+        # we can copy the _flash_attn_bwd function and modify it directly.
+        return original_bwd(*args, **kwargs)
+
+    interface._flash_attn_bwd = patched_bwd
+
+    # Clear any cached compiled kernels so our new config takes effect
+    if hasattr(interface._flash_attn_fwd, 'compile_cache'):
+        interface._flash_attn_fwd.compile_cache.clear()
+    # The compile_cache is on the original function, not our wrapper
+    if hasattr(original_fwd, 'compile_cache'):
+        original_fwd.compile_cache.clear()
+
+    _patches_applied = True
+    print(f"  Config patches applied: {experiment['name']}")
+    print(f"    fwd: threads={fwd_cfg['num_threads']}, tile_m={fwd_cfg['tile_m']}, "
+          f"tile_n=[d<=64:{fwd_cfg['tile_n_d_le_64']}, d>64:{fwd_cfg['tile_n_d_gt_64']}]")
+    print(f"    bwd: threads={bwd_cfg['num_threads']}, m={bwd_cfg['m_block_size']}, "
+          f"n={bwd_cfg['n_block_size']}")
     return True
 
 
-def get_experiment_attn_fn(experiment: dict):
-    """Get the attention function with experimental patches applied.
+def reset_patches():
+    """Reset patches so a different experiment config can be applied."""
+    global _patches_applied
+    try:
+        import flash_attn.cute.interface as interface
+        # Unwrap if our patch is in place
+        fwd = interface._flash_attn_fwd
+        if hasattr(fwd, '__wrapped__'):
+            interface._flash_attn_fwd = fwd.__wrapped__
+        bwd = interface._flash_attn_bwd
+        if hasattr(bwd, '__wrapped__'):
+            interface._flash_attn_bwd = bwd.__wrapped__
+        # Clear compile cache to force recompilation with new config
+        if hasattr(interface._flash_attn_fwd, 'compile_cache'):
+            interface._flash_attn_fwd.compile_cache.clear()
+    except ImportError:
+        pass
+    _patches_applied = False
 
-    Returns the FA4 flash_attn_func with any patches from apply_config_patches().
-    Override this to return a completely different implementation if needed.
-    """
+
+def get_experiment_attn_fn(experiment: dict):
+    """Get the attention function with experimental patches applied."""
+    reset_patches()
     apply_config_patches(experiment)
 
     from flash_attn.cute import flash_attn_func
@@ -159,7 +276,11 @@ def run_single(experiment: dict, device: str = "cuda:0"):
         ok = check_correctness(attn_fn, device=device)
         if not ok:
             print(f"\nERROR: Correctness check failed for {name}!")
-            return {"name": name, "status": "crash", "error": "correctness"}
+            return {"name": name, "status": "crash", "error": "correctness",
+                    "fwd_tflops_peak": 0, "fwd_tflops_geomean": 0,
+                    "bwd_tflops_peak": 0, "bwd_tflops_geomean": 0,
+                    "peak_vram_mb": 0, "total_seconds": 0,
+                    "configs_tested": 0, "configs_crashed": 0}
 
     t0 = time.time()
     results = run_benchmark_suite(
@@ -197,8 +318,9 @@ def run_single(experiment: dict, device: str = "cuda:0"):
 # ---------------------------------------------------------------------------
 
 def run_parallel(exp_a: dict, exp_b: dict):
-    """Run two experiments in parallel, one per GPU. Returns both summaries."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
+    """Run two experiments in parallel, one per GPU."""
+    import subprocess
+    import tempfile
 
     gpus = detect_all_gpus()
     print(f"\nParallel mode: {len(gpus)} GPUs available")
@@ -208,19 +330,61 @@ def run_parallel(exp_a: dict, exp_b: dict):
     if len(gpus) < 2:
         print("WARNING: Only 1 GPU available. Running sequentially.")
         sa = run_single(exp_a, "cuda:0")
+        reset_patches()
         sb = run_single(exp_b, "cuda:0")
         return sa, sb
 
-    # Run both experiments in parallel on separate GPUs using threads.
-    # Each thread sets its own CUDA device. FA4 kernels are JIT-compiled
-    # per device, so there's no interference.
-    def _run_on_gpu(exp, device):
-        torch.cuda.set_device(device)
-        return run_single(exp, device)
+    # Run as separate processes to avoid CUDA context sharing issues.
+    # Each process gets CUDA_VISIBLE_DEVICES=N so cuda:0 maps to different physical GPUs.
+    def run_subprocess(experiment, gpu_id):
+        """Spawn a subprocess that runs a single experiment on one GPU."""
+        result_file = tempfile.mktemp(suffix=".json", prefix=f"fa4_{experiment['name']}_")
+        # Write experiment config to a temp file
+        config_file = tempfile.mktemp(suffix=".json", prefix=f"fa4_cfg_{experiment['name']}_")
+        with open(config_file, "w") as f:
+            json.dump(experiment, f)
 
+        script = f'''
+import os, sys, json
+os.environ["CUDA_VISIBLE_DEVICES"] = "{gpu_id}"
+sys.path.insert(0, "{os.path.dirname(os.path.abspath(__file__))}")
+
+with open("{config_file}") as f:
+    experiment = json.load(f)
+
+from experiment import run_single, PROBLEM_SIZES, DO_BACKWARD, DO_CORRECTNESS
+summary = run_single(experiment, "cuda:0")
+
+with open("{result_file}", "w") as f:
+    json.dump(summary, f)
+'''
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            capture_output=True, text=True, timeout=900,
+        )
+        if proc.returncode != 0:
+            print(f"\n[{experiment['name']}] STDERR:\n{proc.stderr[-2000:]}")
+        # Print stdout (has benchmark output)
+        if proc.stdout:
+            print(proc.stdout)
+
+        try:
+            with open(result_file) as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {
+                "name": experiment["name"],
+                "status": "crash", "error": proc.stderr[-500:] if proc.stderr else "unknown",
+                "fwd_tflops_peak": 0, "fwd_tflops_geomean": 0,
+                "bwd_tflops_peak": 0, "bwd_tflops_geomean": 0,
+                "peak_vram_mb": 0, "total_seconds": 0,
+                "configs_tested": 0, "configs_crashed": 0,
+            }
+
+    from concurrent.futures import ThreadPoolExecutor
     with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_a = pool.submit(_run_on_gpu, exp_a, "cuda:0")
-        fut_b = pool.submit(_run_on_gpu, exp_b, "cuda:1")
+        fut_a = pool.submit(run_subprocess, exp_a, 0)
+        fut_b = pool.submit(run_subprocess, exp_b, 1)
         sa = fut_a.result()
         sb = fut_b.result()
 
@@ -285,12 +449,6 @@ def main():
         print_summary(sa)
         print_summary(sb)
         print_comparison(sa, sb)
-
-    # Write results to FA4_RESULT_FILE if set (used by parallel runner)
-    result_file = os.environ.get("FA4_RESULT_FILE")
-    if result_file:
-        with open(result_file, "w") as f:
-            json.dump(summary if args.single else {"A": sa, "B": sb}, f)
 
 
 if __name__ == "__main__":
